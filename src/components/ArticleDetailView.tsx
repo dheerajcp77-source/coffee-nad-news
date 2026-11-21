@@ -1,8 +1,12 @@
-import { useState } from 'react';
-import { ArrowLeft, Check, Share2 } from 'lucide-react';
-import { resolveArticleImage } from '../data/newsData';
+import { useEffect } from 'react';
+import { ArrowLeft } from 'lucide-react';
+import { getKannadaLocationLabel, resolveArticleImage } from '../data/newsData';
+import { recordArticleView } from '../services/articlesStore';
 import type { NewsArticle } from '../types/news';
+import { sanitizeRichTextHtml, stripRichTextToPlainText } from '../utils/richText';
+import { ArticleShareBar } from './ArticleShareBar';
 import { NewsImage } from './NewsImage';
+import { WhatsAppGroupBanner } from './WhatsAppGroupBanner';
 
 interface ArticleDetailViewProps {
   article: NewsArticle;
@@ -17,25 +21,16 @@ export function ArticleDetailView({
   onBack,
   onSelectArticle,
 }: ArticleDetailViewProps) {
-  const [copied, setCopied] = useState(false);
   const resolvedImage = resolveArticleImage(article);
 
-  const handleCopyShare = async () => {
-    const shareText = `${article.titleKannada} — Coffeenadu News (${article.location})`;
-    try {
-      await navigator.clipboard.writeText(shareText);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    }
-  };
+  useEffect(() => {
+    void recordArticleView(article.id);
+  }, [article.id]);
 
   return (
-    <main className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-10">
-      {/* Top Action Row */}
-      <div className="flex items-center justify-between gap-4 pb-6 border-b border-stone-200">
+    <main className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-10 select-none">
+      {/* Top Action Row with Share above article */}
+      <div className="flex flex-wrap items-center justify-between gap-4 pb-6 border-b border-stone-200">
         <button
           type="button"
           onClick={onBack}
@@ -45,81 +40,100 @@ export function ArticleDetailView({
           <span>Back to Feed</span>
         </button>
 
-        <button
-          type="button"
-          onClick={handleCopyShare}
-          className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-stone-700 bg-stone-100 hover:bg-stone-200 rounded-md transition-colors cursor-pointer min-h-[40px]"
-        >
-          {copied ? (
-            <>
-              <Check className="w-3.5 h-3.5 text-emerald-800" aria-hidden="true" />
-              <span>Copied</span>
-            </>
-          ) : (
-            <>
-              <Share2 className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Share</span>
-            </>
-          )}
-        </button>
+        <ArticleShareBar article={article} />
       </div>
 
-      {/* Article Body */}
-      <article className="py-8 max-w-3xl mx-auto">
-        <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-stone-500 mb-4">
-          <span className="uppercase tracking-wider text-[#0F274A] font-semibold">
-            {article.category}
-          </span>
-          <span aria-hidden="true">·</span>
-          <span>{article.location}</span>
-          <span aria-hidden="true">·</span>
-          <span>{article.publishedDate}</span>
-          <span aria-hidden="true">·</span>
-          <span className="tabular-nums">{article.publishedTime}</span>
-          <span aria-hidden="true">·</span>
-          <span className="tabular-nums">{article.readTimeMinutes} min read</span>
-        </div>
+      {/* Protected Article Body */}
+      <article className="relative py-8 max-w-3xl mx-auto overflow-hidden">
+        <div
+          aria-hidden="true"
+          className="pointer-events-none select-none absolute inset-0 news-watermark-layer opacity-60 z-10"
+        />
 
-        <h1 className="font-kannada text-2xl sm:text-3xl lg:text-4xl font-bold text-stone-950 leading-snug text-balance mb-5">
-          {article.titleKannada}
-        </h1>
+        <div className="relative z-20">
+          <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-stone-500 mb-4">
+            <span className="uppercase tracking-wider text-[#0F274A] font-semibold">
+              {article.category}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span className="font-kannada">{getKannadaLocationLabel(article.location)}</span>
+            <span aria-hidden="true">·</span>
+            <span>{article.publishedDate}</span>
+            <span aria-hidden="true">·</span>
+            <span className="tabular-nums">{article.publishedTime}</span>
+            <span aria-hidden="true">·</span>
+            <span className="tabular-nums">{article.readTimeMinutes} min read</span>
+          </div>
 
-        <p className="font-kannada text-base sm:text-lg text-stone-700 leading-relaxed mb-6 pb-6 border-b border-stone-200">
-          {article.summaryKannada}
-        </p>
+          <h1
+            className="article-rich-content article-rich-inline font-kannada text-2xl sm:text-3xl lg:text-4xl font-bold text-stone-950 leading-snug text-balance mb-5"
+            dangerouslySetInnerHTML={{ __html: sanitizeRichTextHtml(article.titleKannada) }}
+          />
 
-        <div className="flex items-center justify-between text-xs text-stone-500 mb-6">
-          <span>
-            Reported by <strong className="font-semibold text-stone-800">{article.reporter}</strong>
-          </span>
-          <span>Koppa Taluk Desk</span>
-        </div>
+          <div
+            className="article-rich-content article-rich-inline font-kannada text-base sm:text-lg text-stone-700 leading-relaxed mb-6 pb-6 border-b border-stone-200"
+            dangerouslySetInnerHTML={{ __html: sanitizeRichTextHtml(article.summaryKannada) }}
+          />
 
-        {resolvedImage && (
-          <figure className="mb-8">
-            <NewsImage
-              src={resolvedImage}
-              alt={article.titleKannada}
-              aspectClass="aspect-[16/9]"
-              className="rounded-md border border-stone-200"
-            />
-            {article.imageCaption && (
-              <figcaption className="font-kannada text-xs text-stone-500 mt-2.5 leading-relaxed">
-                {article.imageCaption}
-              </figcaption>
-            )}
-          </figure>
-        )}
+          <div className="flex items-center justify-between text-xs text-stone-500 mb-6">
+            <span>
+              Reported by <strong className="font-semibold text-stone-800">{article.reporter}</strong>
+            </span>
+            <span>Koppa Taluk Desk · Protected Read-Only</span>
+          </div>
 
-        <div className="space-y-5 max-w-prose">
-          {article.bodyKannada.map((paragraph, index) => (
-            <p
-              key={index}
-              className="font-kannada text-base sm:text-[17px] text-stone-800 leading-[1.85]"
-            >
-              {paragraph}
-            </p>
-          ))}
+          {resolvedImage && (
+            <figure className="mb-8">
+              <NewsImage
+                src={resolvedImage}
+                alt={stripRichTextToPlainText(article.titleKannada)}
+                aspectClass="aspect-[16/9]"
+                className="rounded-md border border-stone-200"
+                watermarkApplied={Boolean(article.watermarkApplied && article.imageUrl)}
+              />
+              {article.imageCaption && (
+                <figcaption
+                  className="article-rich-content article-rich-inline font-kannada text-xs text-stone-500 mt-2.5 leading-relaxed"
+                  dangerouslySetInnerHTML={{ __html: sanitizeRichTextHtml(article.imageCaption) }}
+                />
+              )}
+            </figure>
+          )}
+
+          <div className="article-rich-content space-y-5 max-w-prose font-kannada text-base sm:text-[17px] text-stone-800 leading-[1.85]">
+            {article.bodyKannada.map((paragraph, index) => {
+              const sanitized = sanitizeRichTextHtml(paragraph);
+              if (!sanitized) return null;
+              const isBlockWrapper = /^<(p|div|h2|h3|ul|ol|blockquote)\b/i.test(sanitized);
+              if (isBlockWrapper) {
+                return (
+                  <div
+                    key={index}
+                    dangerouslySetInnerHTML={{ __html: sanitized }}
+                  />
+                );
+              }
+              return (
+                <p
+                  key={index}
+                  dangerouslySetInnerHTML={{ __html: sanitized }}
+                />
+              );
+            })}
+          </div>
+
+          {/* Join Coffeenadu News WhatsApp Group below every article */}
+          <div className="mt-8">
+            <WhatsAppGroupBanner variant="card" />
+          </div>
+
+          {/* Share Bar below article */}
+          <div className="mt-6 pt-6 border-t border-stone-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <span className="text-xs font-semibold uppercase tracking-wider text-stone-600">
+              Share this Koppa Taluk story
+            </span>
+            <ArticleShareBar article={article} />
+          </div>
         </div>
       </article>
 
@@ -127,7 +141,7 @@ export function ArticleDetailView({
       {relatedArticles.length > 0 && (
         <section
           aria-label="More local news"
-          className="mt-10 pt-8 border-t border-stone-200 max-w-3xl mx-auto"
+          className="mt-6 pt-8 border-t border-stone-200 max-w-3xl mx-auto"
         >
           <h2 className="text-sm font-semibold uppercase tracking-wider text-stone-500 mb-5">
             More from {article.category}
@@ -141,13 +155,14 @@ export function ArticleDetailView({
                 className="w-full text-left py-4 group flex flex-col gap-1.5 hover:bg-stone-50/80 transition-colors cursor-pointer px-2 -mx-2 rounded-sm"
               >
                 <div className="flex items-center gap-2 text-xs text-stone-500">
-                  <span>{related.location}</span>
+                  <span className="font-kannada">{getKannadaLocationLabel(related.location)}</span>
                   <span aria-hidden="true">·</span>
                   <span>{related.publishedDate}</span>
                 </div>
-                <h3 className="font-kannada text-base sm:text-lg font-semibold text-stone-900 group-hover:text-emerald-900 transition-colors leading-snug">
-                  {related.titleKannada}
-                </h3>
+                <h3
+                  className="article-rich-content article-rich-inline-compact font-kannada text-base sm:text-lg font-semibold text-stone-900 group-hover:text-emerald-900 transition-colors leading-snug"
+                  dangerouslySetInnerHTML={{ __html: sanitizeRichTextHtml(related.titleKannada) }}
+                />
               </button>
             ))}
           </div>

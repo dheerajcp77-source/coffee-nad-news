@@ -1,27 +1,133 @@
 import 'dotenv/config';
+import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import {
-  KOPPA_LOCATIONS,
-  NEWS_CATEGORIES,
-  SEED_ARTICLES,
-} from './src/data/seedArticles.ts';
-import type {
-  BusAgentChatTurn,
-  BusAgentMatchedRoute,
-  BusAgentResponse,
-  BusAgentTimePreference,
-  BusPlaceScheduleResponse,
-  BusPlaceSummary,
-  BusRouteSchedule,
-  ImageKey,
-  NewsArticle,
-  NewsCategory,
-} from './src/types/news.ts';
+import { SEED_ARTICLES as PORTAL_SEED_ARTICLES } from './src/data/seedArticles.ts';
+import { SheetsStorageManager } from './src/server/sheetsStorageProxy.ts';
+
+const execFileAsync = promisify(execFile);
+type NewsCategory =
+  | 'Local'
+  | 'Agriculture'
+  | 'Civic & Roads'
+  | 'Education'
+  | 'Culture'
+  | 'Sports';
+
+type ImageKey =
+  | 'none'
+  | 'koppa-landscape'
+  | 'coffee-estate'
+  | 'tunga-bridge'
+  | 'malnad-culture';
+
+interface NewsArticle {
+  id: string;
+  titleKannada: string;
+  summaryKannada: string;
+  bodyKannada: string[];
+  category: NewsCategory;
+  location: string;
+  publishedDate: string;
+  publishedTime: string;
+  publishedTimestamp?: number;
+  readTimeMinutes: number;
+  reporter: string;
+  imageKey?: ImageKey;
+  imageUrl?: string;
+  imageCaption?: string;
+  isFeatured?: boolean;
+  authorUid?: string;
+}
+
+interface BusTimingItem {
+  timingId: number;
+  departureTime: string;
+  departureTime24?: string;
+  busName: string;
+  remarks: string;
+  fromPlaceEn?: string;
+  fromPlaceKn?: string;
+}
+
+interface BusRouteSchedule {
+  routeId: number;
+  routeName: string;
+  description: string;
+  timings: BusTimingItem[];
+}
+
+interface BusPlaceSummary {
+  titleId: number;
+  placeId: number;
+  nameEn: string;
+  nameKn: string;
+  routeCount: number;
+}
+
+interface BusPlaceScheduleResponse {
+  places: BusPlaceSummary[];
+  activePlace: BusPlaceSummary;
+  routes: BusRouteSchedule[];
+}
+
+type BusAgentTimePreference = 'all' | 'morning' | 'afternoon' | 'evening';
+
+interface BusAgentChatTurn {
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+interface BusAgentMatchedRoute {
+  placeNameEn: string;
+  placeNameKn: string;
+  routeId: number;
+  routeTitle: string;
+  routeSubtitle?: string;
+  fromPlaceLabel: string;
+  matchType: 'direct' | 'via';
+  timings: BusTimingItem[];
+}
+
+interface BusAgentResponse {
+  status: 'needs_both' | 'needs_origin' | 'needs_destination' | 'ready';
+  reply: string;
+  origin?: string;
+  destination?: string;
+  timePreference?: BusAgentTimePreference;
+  matchedRoutes: BusAgentMatchedRoute[];
+  suggestedHubs?: string[];
+}
+
+const NEWS_CATEGORIES: NewsCategory[] = [
+  'Local',
+  'Agriculture',
+  'Civic & Roads',
+  'Education',
+  'Culture',
+  'Sports',
+];
+
+const KOPPA_LOCATIONS: string[] = [
+  'Koppa Town',
+  'Jayapura',
+  'Hariharapura',
+  'Basarikatte',
+  'Kudregundi',
+  'Megur',
+  'Narve',
+];
+
+const REMOVED_LEGACY_ARTICLE_IDS = new Set(['koppa-fog-advisory-01']);
+
+const SEED_ARTICLES: NewsArticle[] = (PORTAL_SEED_ARTICLES as unknown as NewsArticle[]).filter(
+  (article) => !REMOVED_LEGACY_ARTICLE_IDS.has(article.id)
+);
 
 interface AdminAuthRecord {
   email: string;
@@ -138,7 +244,15 @@ function loadArticles(): NewsArticle[] {
       const raw = fs.readFileSync(ARTICLES_FILE, 'utf8');
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        return parsed as NewsArticle[];
+        const cleaned = (parsed as NewsArticle[]).filter(
+          (article) => article && !REMOVED_LEGACY_ARTICLE_IDS.has(article.id)
+        );
+        if (cleaned.length !== parsed.length) {
+          const next = cleaned.length > 0 ? cleaned : [...SEED_ARTICLES];
+          fs.writeFileSync(ARTICLES_FILE, JSON.stringify(next, null, 2), 'utf8');
+          return next;
+        }
+        return cleaned;
       }
     } catch {
       // Fallback to seed below
@@ -1304,6 +1418,10 @@ async function startServer() {
     res.json({ ok: true });
   });
 
+  // Mount free Google Sheets + Drive + Apps Script storage proxy, cache & view aggregator
+  const sheetsStorage = new SheetsStorageManager(DATA_DIR);
+  sheetsStorage.mountRoutes(app);
+
   // Public Bus Timings endpoint sourced from hudkoo.com with 6-hour cache
   app.get('/api/bus-timings', async (req, res) => {
     const requestedTitleId = Number(req.query.titleId) || 1;
@@ -2132,33 +2250,654 @@ Rules:
     res.json({ ok: true, articles: next });
   });
 
+  // Dynamic image endpoint for WhatsApp & social OpenGraph previews
+  interface FirebaseRuntimeConfig {
+    projectId: string;
+    firestoreDatabaseId: string;
+    apiKey: string;
+  }
+
+  let cachedFirebaseConfig: FirebaseRuntimeConfig | null = null;
+  function getFirebaseRuntimeConfig(): FirebaseRuntimeConfig | null {
+    if (cachedFirebaseConfig) return cachedFirebaseConfig;
+    try {
+      const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+      const raw = fs.readFileSync(cfgPath, 'utf8');
+      const parsed = JSON.parse(raw) as Partial<FirebaseRuntimeConfig>;
+      if (parsed.projectId && parsed.firestoreDatabaseId) {
+        cachedFirebaseConfig = {
+          projectId: parsed.projectId,
+          firestoreDatabaseId: parsed.firestoreDatabaseId,
+          apiKey: parsed.apiKey || '',
+        };
+        return cachedFirebaseConfig;
+      }
+    } catch {
+      // Config not present
+    }
+    return null;
+  }
+
+  const PRESET_IMAGE_FILES: Record<string, string> = {
+    'koppa-landscape': 'koppa_town_landscape_1794709366123.jpg',
+    'malnad-hills': 'malnad_hills_road_1794833446049.jpg',
+    'coffee-estate': 'coffee_arecanut_estate_1794709367051.jpg',
+    'health-medical': 'health_hospital_care_1794833609245.jpg',
+    'entertainment-stage': 'entertainment_cinema_stage_1794833457980.jpg',
+    'crime-alert': 'crime_police_patrol_1794833449002.jpg',
+    'general-news': 'general_news_morning_1794833645570.jpg',
+    'politics-assembly': 'politics_assembly_podium_1794833641337.jpg',
+    'sports-stadium': 'sports_stadium_match_1794833642170.jpg',
+    'special-feature': 'special_feature_ghats_1794833452939.jpg',
+    'state-civic': 'state_civic_architecture_1794833643485.jpg',
+    'nation-parliament': 'nation_parliament_flag_1794833641928.jpg',
+    'tunga-bridge': 'tunga_river_bridge_1794709366458.jpg',
+    'education-library': 'education_library_study_1794833645509.jpg',
+    'malnad-culture': 'malnad_cultural_heritage_1794709367996.jpg',
+  };
+
+  const CATEGORY_DEFAULT_IMAGE_KEY_MAP: Record<string, string> = {
+    Local: 'koppa-landscape',
+    Malnad: 'malnad-hills',
+    Agriculture: 'coffee-estate',
+    Health: 'health-medical',
+    Entertainment: 'entertainment-stage',
+    Crime: 'crime-alert',
+    General: 'general-news',
+    Politics: 'politics-assembly',
+    Sports: 'sports-stadium',
+    Special: 'special-feature',
+    State: 'state-civic',
+    Nation: 'nation-parliament',
+    'Civic & Roads': 'tunga-bridge',
+    Education: 'education-library',
+    Culture: 'malnad-culture',
+  };
+
+  interface FirestoreShareMetadata {
+    id: string;
+    titleKannada: string;
+    summaryKannada: string;
+    category: string;
+    location: string;
+    imageKey: string;
+    imageUrl: string;
+    watermarkApplied: boolean;
+  }
+
+  function readFirestoreStringField(
+    fields: Record<string, { stringValue?: string; booleanValue?: boolean }> | undefined,
+    key: string
+  ): string {
+    const val = fields?.[key]?.stringValue;
+    return typeof val === 'string' ? val : '';
+  }
+
+  function readFirestoreBooleanField(
+    fields: Record<string, { stringValue?: string; booleanValue?: boolean }> | undefined,
+    key: string
+  ): boolean {
+    return fields?.[key]?.booleanValue === true;
+  }
+
+  const watermarkedPresetCache = new Map<string, Buffer>();
+
+  function getCircleLogoAssetPath(): string | null {
+    const primary = path.resolve(process.cwd(), 'src/assets/images/coffeenadu_logo_circle.png');
+    if (fs.existsSync(primary)) return primary;
+    const secondary = path.resolve(process.cwd(), 'public/assets/coffeenadu_logo_circle.png');
+    if (fs.existsSync(secondary)) return secondary;
+    return null;
+  }
+
+  async function compositeCircularWatermarkOnBuffer(inputBuffer: Buffer): Promise<Buffer> {
+    const logoPath = getCircleLogoAssetPath();
+    if (!logoPath) return inputBuffer;
+
+    const uid = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const tmpIn = path.join(os.tmpdir(), `cn-in-${uid}.img`);
+    const tmpOut = path.join(os.tmpdir(), `cn-out-${uid}.jpg`);
+
+    try {
+      fs.writeFileSync(tmpIn, inputBuffer);
+      const { stdout } = await execFileAsync('identify', ['-format', '%w %h', tmpIn], {
+        timeout: 4000,
+      });
+      const [wStr, hStr] = stdout.trim().split(/\s+/);
+      const w = Number(wStr) || 800;
+      const h = Number(hStr) || 450;
+      const minDim = Math.max(1, Math.min(w, h));
+      const size =
+        minDim <= 140
+          ? Math.max(20, Math.min(36, Math.round(minDim * 0.26)))
+          : Math.max(36, Math.min(128, Math.round(minDim * 0.145)));
+      const pad =
+        minDim <= 140
+          ? Math.max(5, Math.round(minDim * 0.06))
+          : Math.max(10, Math.round(minDim * 0.032));
+
+      await execFileAsync(
+        'convert',
+        [
+          tmpIn,
+          '(',
+          logoPath,
+          '-resize',
+          `${size}x${size}`,
+          ')',
+          '-geometry',
+          `+${pad}+${pad}`,
+          '-compose',
+          'Over',
+          '-composite',
+          '-quality',
+          '88',
+          tmpOut,
+        ],
+        { timeout: 6000 }
+      );
+
+      if (fs.existsSync(tmpOut)) {
+        return fs.readFileSync(tmpOut);
+      }
+      return inputBuffer;
+    } catch {
+      return inputBuffer;
+    } finally {
+      try {
+        if (fs.existsSync(tmpIn)) fs.unlinkSync(tmpIn);
+      } catch {
+        // Ignore cleanup failure
+      }
+      try {
+        if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
+      } catch {
+        // Ignore cleanup failure
+      }
+    }
+  }
+
+  const SHARE_METADATA_TTL_MS = 10 * 60 * 1000;
+  const shareMetadataCache = new Map<
+    string,
+    { data: FirestoreShareMetadata; expiresAt: number }
+  >();
+  const shareMetadataInFlight = new Map<string, Promise<FirestoreShareMetadata | null>>();
+  let serverFirestoreQuotaCooldownUntil = 0;
+
+  async function fetchShareDocMetadata(
+    collectionName: 'articles' | 'events',
+    docId: string
+  ): Promise<FirestoreShareMetadata | null> {
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(docId)) return null;
+    if (collectionName === 'articles' && REMOVED_LEGACY_ARTICLE_IDS.has(docId)) {
+      return null;
+    }
+
+    const cacheKey = `${collectionName}:${docId}`;
+    const cached = shareMetadataCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.data;
+    }
+
+    if (Date.now() < serverFirestoreQuotaCooldownUntil && cached) {
+      return cached.data;
+    }
+
+    const existingPromise = shareMetadataInFlight.get(cacheKey);
+    if (existingPromise) {
+      return existingPromise;
+    }
+
+    const task = (async (): Promise<FirestoreShareMetadata | null> => {
+      // 1. Prefer Google Sheets + Apps Script cached storage when configured
+      if (sheetsStorage.isConfigured()) {
+        const sheetsMeta = await sheetsStorage.lookupShareMetadata(collectionName, docId);
+        if (sheetsMeta) {
+          shareMetadataCache.set(cacheKey, {
+            data: sheetsMeta,
+            expiresAt: Date.now() + SHARE_METADATA_TTL_MS,
+          });
+          return sheetsMeta;
+        }
+      }
+
+      // 2. Fallback to Firebase Firestore REST (kept intact as rollback/pre-migration source)
+      const cfg = getFirebaseRuntimeConfig();
+      if (cfg && Date.now() >= serverFirestoreQuotaCooldownUntil) {
+        try {
+          const apiUrl = new URL(
+            `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+              cfg.projectId
+            )}/databases/${encodeURIComponent(
+              cfg.firestoreDatabaseId
+            )}/documents/${collectionName}/${encodeURIComponent(docId)}`
+          );
+          if (cfg.apiKey) {
+            apiUrl.searchParams.set('key', cfg.apiKey);
+          }
+          const response = await fetch(apiUrl.toString(), {
+            signal: AbortSignal.timeout(3500),
+          });
+          if (response.status === 429) {
+            serverFirestoreQuotaCooldownUntil = Date.now() + 60 * 1000;
+            if (cached) return cached.data;
+          } else if (response.ok) {
+            const json = (await response.json()) as {
+              fields?: Record<string, { stringValue?: string; booleanValue?: boolean }>;
+            };
+            if (json.fields) {
+              const meta: FirestoreShareMetadata = {
+                id: docId,
+                titleKannada: readFirestoreStringField(json.fields, 'titleKannada'),
+                summaryKannada:
+                  readFirestoreStringField(json.fields, 'summaryKannada') ||
+                  readFirestoreStringField(json.fields, 'descriptionKannada'),
+                category: readFirestoreStringField(json.fields, 'category') || 'Local',
+                location: readFirestoreStringField(json.fields, 'location') || 'ಕೊಪ್ಪ',
+                imageKey: readFirestoreStringField(json.fields, 'imageKey') || 'none',
+                imageUrl: readFirestoreStringField(json.fields, 'imageUrl'),
+                watermarkApplied: readFirestoreBooleanField(json.fields, 'watermarkApplied'),
+              };
+              if (shareMetadataCache.size > 250) {
+                const oldestKey = shareMetadataCache.keys().next().value;
+                if (oldestKey) shareMetadataCache.delete(oldestKey);
+              }
+              shareMetadataCache.set(cacheKey, {
+                data: meta,
+                expiresAt: Date.now() + SHARE_METADATA_TTL_MS,
+              });
+              return meta;
+            }
+          }
+        } catch {
+          if (cached) return cached.data;
+        }
+      }
+
+      if (cached) {
+        return cached.data;
+      }
+
+      if (collectionName === 'articles') {
+        const seed = PORTAL_SEED_ARTICLES.find((a) => a.id === docId);
+        if (seed) {
+          return {
+            id: seed.id,
+            titleKannada: seed.titleKannada,
+            summaryKannada: seed.summaryKannada,
+            category: seed.category,
+            location: seed.location,
+            imageKey: seed.imageKey || 'none',
+            imageUrl: seed.imageUrl || '',
+            watermarkApplied: Boolean(seed.watermarkApplied && seed.imageUrl),
+          };
+        }
+      }
+
+      return null;
+    })().finally(() => {
+      shareMetadataInFlight.delete(cacheKey);
+    });
+
+    shareMetadataInFlight.set(cacheKey, task);
+    return task;
+  }
+
+  function resolvePresetImageFilePath(imageKey: string, category: string): string {
+    const resolvedKey =
+      imageKey && imageKey !== 'none' && PRESET_IMAGE_FILES[imageKey]
+        ? imageKey
+        : CATEGORY_DEFAULT_IMAGE_KEY_MAP[category] || 'koppa-landscape';
+    const fileName = PRESET_IMAGE_FILES[resolvedKey] || 'koppa_town_landscape_1794709366123.jpg';
+    return path.resolve(process.cwd(), 'src/assets/images', fileName);
+  }
+
+  async function sendResolvedImageResponse(
+    res: Response,
+    imageUrl: string,
+    watermarkApplied: boolean,
+    fallbackFilePath: string
+  ): Promise<void> {
+    if (imageUrl) {
+      const dataMatch = imageUrl.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/s);
+      if (dataMatch) {
+        const mimeType = dataMatch[1];
+        const rawBuffer = Buffer.from(dataMatch[2], 'base64');
+        const outBuffer = watermarkApplied
+          ? rawBuffer
+          : await compositeCircularWatermarkOnBuffer(rawBuffer);
+        res.setHeader('Content-Type', watermarkApplied ? mimeType : 'image/jpeg');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.send(outBuffer);
+        return;
+      }
+      if (imageUrl.startsWith('/api/media/drive/')) {
+        const driveId = imageUrl.replace('/api/media/drive/', '').split('?')[0].trim();
+        if (/^[a-zA-Z0-9_-]{10,120}$/.test(driveId)) {
+          const driveCacheFile = path.join(DATA_DIR, 'drive-image-cache', driveId);
+          try {
+            let rawBuf: Buffer | null = null;
+            if (fs.existsSync(driveCacheFile)) {
+              rawBuf = fs.readFileSync(driveCacheFile);
+            } else {
+              const resp = await fetch(`https://lh3.googleusercontent.com/d/${encodeURIComponent(driveId)}=w1200`, {
+                redirect: 'follow',
+                signal: AbortSignal.timeout(5000),
+              });
+              if (resp.ok) {
+                rawBuf = Buffer.from(await resp.arrayBuffer());
+              }
+            }
+            if (rawBuf && rawBuf.length > 0) {
+              const outBuffer = watermarkApplied
+                ? rawBuf
+                : await compositeCircularWatermarkOnBuffer(rawBuf);
+              res.setHeader('Content-Type', 'image/jpeg');
+              res.setHeader('Cache-Control', 'public, max-age=3600');
+              res.send(outBuffer);
+              return;
+            }
+          } catch {
+            // Fall through to preset fallback
+          }
+        }
+      }
+      if (/^https?:\/\//i.test(imageUrl)) {
+        if (!watermarkApplied) {
+          try {
+            const imgResp = await fetch(imageUrl, { signal: AbortSignal.timeout(4000) });
+            if (imgResp.ok) {
+              const arr = Buffer.from(await imgResp.arrayBuffer());
+              const outBuffer = await compositeCircularWatermarkOnBuffer(arr);
+              res.setHeader('Content-Type', 'image/jpeg');
+              res.setHeader('Cache-Control', 'public, max-age=3600');
+              res.send(outBuffer);
+              return;
+            }
+          } catch {
+            // Fall through to redirect if upstream fetch fails
+          }
+        }
+        res.redirect(302, imageUrl);
+        return;
+      }
+    }
+
+    if (fs.existsSync(fallbackFilePath)) {
+      let cached = watermarkedPresetCache.get(fallbackFilePath);
+      if (!cached) {
+        const rawPreset = fs.readFileSync(fallbackFilePath);
+        cached = await compositeCircularWatermarkOnBuffer(rawPreset);
+        watermarkedPresetCache.set(fallbackFilePath, cached);
+      }
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.send(cached);
+      return;
+    }
+
+    res.status(404).end();
+  }
+
+  app.get('/api/article-image/:id', async (req, res) => {
+    const articleId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+    const meta = await fetchShareDocMetadata('articles', articleId);
+    const fallbackFile = resolvePresetImageFilePath(
+      meta?.imageKey || 'none',
+      meta?.category || 'Local'
+    );
+    await sendResolvedImageResponse(
+      res,
+      meta?.imageUrl || '',
+      Boolean(meta?.watermarkApplied && meta?.imageUrl),
+      fallbackFile
+    );
+  });
+
+  app.get('/api/event-image/:id', async (req, res) => {
+    const eventId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+    const meta = await fetchShareDocMetadata('events', eventId);
+    const fallbackFile = resolvePresetImageFilePath('entertainment-stage', 'Entertainment');
+    await sendResolvedImageResponse(
+      res,
+      meta?.imageUrl || '',
+      Boolean(meta?.watermarkApplied && meta?.imageUrl),
+      fallbackFile
+    );
+  });
+
   app.use('/api', (_req, res) => {
     res.status(404).json({ error: 'API route not found.' });
   });
 
+  function escapeHtmlAttr(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function getRequestOrigin(req: Request): string {
+    const forwardedProto = req.headers['x-forwarded-proto'];
+    const proto =
+      typeof forwardedProto === 'string' && forwardedProto
+        ? forwardedProto.split(',')[0].trim()
+        : req.protocol || 'https';
+    const forwardedHost = req.headers['x-forwarded-host'];
+    const host =
+      typeof forwardedHost === 'string' && forwardedHost
+        ? forwardedHost.split(',')[0].trim()
+        : req.get('host') || 'localhost:3000';
+    return `${proto}://${host}`;
+  }
+
+  function injectOpenGraphTags(
+    html: string,
+    opts: {
+      title: string;
+      description: string;
+      imageUrl: string;
+      pageUrl: string;
+      ogType: 'article' | 'website';
+    }
+  ): string {
+    const safeTitle = escapeHtmlAttr(opts.title);
+    const safeDesc = escapeHtmlAttr(opts.description);
+    const safeImg = escapeHtmlAttr(opts.imageUrl);
+    const safeUrl = escapeHtmlAttr(opts.pageUrl);
+
+    let result = html
+      .replace(/<title>[\s\S]*?<\/title>/i, `<title>${safeTitle}</title>`)
+      .replace(
+        /<meta\s+name="description"\s+content="[^"]*"\s*\/?>/i,
+        `<meta name="description" content="${safeDesc}" />`
+      )
+      .replace(
+        /<meta\s+property="og:title"\s+content="[^"]*"\s*\/?>/i,
+        `<meta property="og:title" content="${safeTitle}" />`
+      )
+      .replace(
+        /<meta\s+property="og:description"\s+content="[^"]*"\s*\/?>/i,
+        `<meta property="og:description" content="${safeDesc}" />`
+      )
+      .replace(
+        /<meta\s+property="og:type"\s+content="[^"]*"\s*\/?>/i,
+        `<meta property="og:type" content="${opts.ogType}" />`
+      );
+
+    const extraMetaTags = [
+      `<meta property="og:url" content="${safeUrl}" />`,
+      `<meta property="og:image" content="${safeImg}" />`,
+      `<meta property="og:image:secure_url" content="${safeImg}" />`,
+      `<meta property="og:image:type" content="image/jpeg" />`,
+      `<meta property="og:image:width" content="1200" />`,
+      `<meta property="og:image:height" content="630" />`,
+      `<meta name="twitter:title" content="${safeTitle}" />`,
+      `<meta name="twitter:description" content="${safeDesc}" />`,
+      `<meta name="twitter:image" content="${safeImg}" />`,
+    ].join('\n    ');
+
+    return result.replace('</head>', `    ${extraMetaTags}\n  </head>`);
+  }
+
   const distDir = path.resolve(process.cwd(), 'dist');
   const distIndex = path.join(distDir, 'index.html');
+  const rootIndex = path.resolve(process.cwd(), 'index.html');
   const isDevMode =
     process.env.COFFEENADU_DEV === '1' ||
     (process.env.NODE_ENV !== 'production' && !fs.existsSync(distIndex));
 
-  if (isDevMode) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+  const vite = isDevMode
+    ? await (
+        await import('vite')
+      ).createServer({
+        server: {
+          middlewareMode: true,
+          hmr: false,
+          watch: process.env.DISABLE_HMR === 'true' ? null : undefined,
+        },
+        appType: 'spa',
+      })
+    : null;
+
+  app.get(['/', '/events'], async (req, res, next) => {
+    const articleId =
+      req.path === '/' && typeof req.query.article === 'string'
+        ? req.query.article.trim()
+        : '';
+    const eventId =
+      req.path === '/events' && typeof req.query.event === 'string'
+        ? req.query.event.trim()
+        : '';
+
+    if (!articleId && !eventId) {
+      next();
+      return;
+    }
+
+    try {
+      const origin = getRequestOrigin(req);
+      let ogTitle = 'Coffeenadu News — Koppa Taluk Local Kannada News';
+      let ogDescription =
+        'Local Koppa Taluk news publishing portal featuring Kannada updates, bus timings, and programs.';
+      const defaultSeedId = PORTAL_SEED_ARTICLES[0]?.id || 'jayapura-coffee-harvest-02';
+      let ogImageUrl = `${origin}/api/article-image/${encodeURIComponent(defaultSeedId)}`;
+      let ogUrl = `${origin}${req.originalUrl}`;
+
+      const stripMarkupForMeta = (raw: string): string =>
+        String(raw || '')
+          .replace(/<br\s*\/?>/gi, ' ')
+          .replace(/<[^>]+>/g, '')
+          .replace(/&nbsp;/gi, ' ')
+          .replace(/&amp;/gi, '&')
+          .replace(/&lt;/gi, '<')
+          .replace(/&gt;/gi, '>')
+          .replace(/&quot;/gi, '"')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+      if (articleId) {
+        const meta = await fetchShareDocMetadata('articles', articleId);
+        if (meta) {
+          const cleanMetaTitle = stripMarkupForMeta(meta.titleKannada);
+          const cleanMetaSummary = stripMarkupForMeta(meta.summaryKannada);
+          ogTitle = cleanMetaTitle
+            ? `${cleanMetaTitle} — Coffeenadu News`
+            : ogTitle;
+          ogDescription = cleanMetaSummary || ogDescription;
+          ogImageUrl = `${origin}/api/article-image/${encodeURIComponent(articleId)}`;
+        }
+      } else if (eventId) {
+        const meta = await fetchShareDocMetadata('events', eventId);
+        if (meta) {
+          const cleanMetaTitle = stripMarkupForMeta(meta.titleKannada);
+          const cleanMetaSummary = stripMarkupForMeta(meta.summaryKannada);
+          ogTitle = cleanMetaTitle
+            ? `${cleanMetaTitle} — Coffeenadu Programs`
+            : ogTitle;
+          ogDescription = cleanMetaSummary || ogDescription;
+          ogImageUrl = `${origin}/api/event-image/${encodeURIComponent(eventId)}`;
+        }
+      }
+
+      const rawTemplate = fs.readFileSync(vite ? rootIndex : distIndex, 'utf8');
+      const transformed = vite
+        ? await vite.transformIndexHtml(req.originalUrl, rawTemplate)
+        : rawTemplate;
+
+      const htmlWithOg = injectOpenGraphTags(transformed, {
+        title: ogTitle,
+        description: ogDescription.slice(0, 300),
+        imageUrl: ogImageUrl,
+        pageUrl: ogUrl,
+        ogType: articleId ? 'article' : 'website',
+      });
+
+      res
+        .status(200)
+        .set({
+          'Content-Type': 'text/html',
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+        })
+        .end(htmlWithOg);
+    } catch {
+      next();
+    }
+  });
+
+  if (vite) {
+    app.use((req, res, next) => {
+      if (req.method === 'GET' && (req.headers.accept || '').includes('text/html')) {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      }
+      next();
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(distDir));
+    app.use(
+      express.static(distDir, {
+        setHeaders(res, filePath) {
+          if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+          }
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       res.sendFile(distIndex);
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Coffeenadu News server running on http://0.0.0.0:${PORT}`);
   });
+
+  let isShuttingDown = false;
+  const gracefulShutdown = () => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    const forceExitTimer = setTimeout(() => {
+      process.exit(0);
+    }, 1500);
+    forceExitTimer.unref?.();
+
+    Promise.allSettled([
+      new Promise<void>((resolve) => httpServer.close(() => resolve())),
+      vite ? vite.close() : Promise.resolve(),
+      sheetsStorage.flushPendingViews(),
+    ]).finally(() => {
+      process.exit(0);
+    });
+  };
+
+  process.on('SIGTERM', gracefulShutdown);
+  process.on('SIGINT', gracefulShutdown);
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Failed to start Coffeenadu News server:', err);
+  process.exit(1);
+});

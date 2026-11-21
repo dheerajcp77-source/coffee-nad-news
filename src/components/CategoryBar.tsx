@@ -1,17 +1,25 @@
 import {
+  Building2,
   CloudSun,
+  Film,
+  Globe,
   GraduationCap,
+  HeartPulse,
   Landmark,
   MapPin,
+  Mountain,
   Newspaper,
   Search,
+  ShieldAlert,
+  Sparkles,
   Sprout,
   Theater,
   Trophy,
+  Vote,
   X,
 } from 'lucide-react';
 import koppaLandscapeImg from '../assets/images/koppa_town_landscape_1794709366123.jpg';
-import { KOPPA_LOCATIONS, NEWS_CATEGORIES } from '../data/newsData';
+import { KOPPA_PLACE_OPTIONS, NEWS_CATEGORIES } from '../data/newsData';
 import type { FilterCategory, NewsCategory } from '../types/news';
 
 interface CategoryBarProps {
@@ -31,16 +39,34 @@ function renderCategoryIcon(category: FilterCategory) {
       return <Newspaper className="w-4 h-4 shrink-0" aria-hidden="true" />;
     case 'Local':
       return <MapPin className="w-4 h-4 shrink-0" aria-hidden="true" />;
+    case 'Malnad':
+      return <Mountain className="w-4 h-4 shrink-0" aria-hidden="true" />;
     case 'Agriculture':
       return <Sprout className="w-4 h-4 shrink-0" aria-hidden="true" />;
+    case 'Health':
+      return <HeartPulse className="w-4 h-4 shrink-0" aria-hidden="true" />;
+    case 'Entertainment':
+      return <Film className="w-4 h-4 shrink-0" aria-hidden="true" />;
+    case 'Crime':
+      return <ShieldAlert className="w-4 h-4 shrink-0" aria-hidden="true" />;
+    case 'General':
+      return <Newspaper className="w-4 h-4 shrink-0" aria-hidden="true" />;
+    case 'Politics':
+      return <Vote className="w-4 h-4 shrink-0" aria-hidden="true" />;
+    case 'Sports':
+      return <Trophy className="w-4 h-4 shrink-0" aria-hidden="true" />;
+    case 'Special':
+      return <Sparkles className="w-4 h-4 shrink-0" aria-hidden="true" />;
+    case 'State':
+      return <Building2 className="w-4 h-4 shrink-0" aria-hidden="true" />;
+    case 'Nation':
+      return <Globe className="w-4 h-4 shrink-0" aria-hidden="true" />;
     case 'Civic & Roads':
       return <Landmark className="w-4 h-4 shrink-0" aria-hidden="true" />;
     case 'Education':
       return <GraduationCap className="w-4 h-4 shrink-0" aria-hidden="true" />;
     case 'Culture':
       return <Theater className="w-4 h-4 shrink-0" aria-hidden="true" />;
-    case 'Sports':
-      return <Trophy className="w-4 h-4 shrink-0" aria-hidden="true" />;
   }
 }
 
@@ -71,7 +97,10 @@ export function CategoryBar({
               src={koppaLandscapeImg}
               alt="Koppa Taluk hills and morning road"
               referrerPolicy="no-referrer"
-              className="absolute inset-0 w-full h-full object-cover object-center"
+              draggable={false}
+              onDragStart={(e) => e.preventDefault()}
+              onContextMenu={(e) => e.preventDefault()}
+              className="absolute inset-0 w-full h-full object-cover object-center pointer-events-none select-none"
             />
             <div
               className="absolute inset-0 bg-gradient-to-r from-[#F8FAFC] via-[#F8FAFC]/90 to-[#F8FAFC]/20 sm:via-[#F8FAFC]/85"
@@ -83,25 +112,25 @@ export function CategoryBar({
                 <div className="flex items-center gap-2">
                   <MapPin className="w-6 h-6 text-red-600 shrink-0" aria-hidden="true" />
                   <label htmlFor="hero-location-select" className="sr-only">
-                    Select Koppa Taluk town or hobli
+                    Select place in Kannada
                   </label>
                   <select
                     id="hero-location-select"
                     value={selectedLocation}
                     onChange={(e) => onSelectLocation(e.target.value)}
-                    className="bg-transparent text-2xl sm:text-3xl font-extrabold text-[#0F274A] tracking-tight focus:outline-none cursor-pointer pr-2"
+                    className="font-kannada bg-transparent text-2xl sm:text-3xl font-extrabold text-[#0F274A] tracking-tight focus:outline-none cursor-pointer pr-2"
                   >
-                    <option value="All">Koppa Taluk</option>
-                    {KOPPA_LOCATIONS.map((loc) => (
-                      <option key={loc} value={loc}>
-                        {loc}
+                    <option value="All">ಎಲ್ಲಾ ಸ್ಥಳಗಳು (All)</option>
+                    {KOPPA_PLACE_OPTIONS.map((place) => (
+                      <option key={place.id} value={place.labelKn}>
+                        {place.labelKn}
                       </option>
                     ))}
                   </select>
                 </div>
 
-                <p className="text-sm sm:text-base font-medium text-slate-700">
-                  Local Kannada news from Koppa, Jayapura, Hariharapura &amp; Malnad
+                <p className="font-kannada text-sm sm:text-base font-medium text-slate-700">
+                  ಕೊಪ್ಪ, ಜಯಪುರ, ಶೃಂಗೇರಿ, ಬಾಳೆಹೊನ್ನೂರು, ಹರಿಹರಪುರ, ಎನ್.ಆರ್. ಪುರ, ಚಿಕ್ಕಮಗಳೂರು ಮತ್ತು ಮಲೆನಾಡು ಸುದ್ದಿಗಳು
                 </p>
 
                 <div className="inline-flex items-center gap-2.5 text-xs sm:text-sm font-medium text-slate-800 bg-white/95 border border-slate-200 px-3 py-1.5 rounded-lg">
@@ -130,8 +159,8 @@ export function CategoryBar({
                   type="search"
                   value={searchQuery}
                   onChange={(e) => onSearchChange(e.target.value)}
-                  placeholder="Search town or Kannada news..."
-                  aria-label="Search Koppa Taluk news"
+                  placeholder="Search place or Kannada news..."
+                  aria-label="Search news"
                   className="w-full pl-9 pr-9 py-2.5 text-sm bg-white/95 border border-slate-200 rounded-xl text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#0F274A] shadow-xs min-h-[42px]"
                 />
                 {searchQuery && (

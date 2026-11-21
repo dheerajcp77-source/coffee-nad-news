@@ -1,20 +1,44 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowRight, Calendar, ChevronRight, Clock } from 'lucide-react';
-import koppaLandscapeImg from './assets/images/koppa_town_landscape_1794709366123.jpg';
+import { AlertCircle, Calendar, ChevronRight, Clock, Loader2, MessageSquare } from 'lucide-react';
 import { AdminPanel } from './components/AdminPanel';
 import { ArticleDetailView } from './components/ArticleDetailView';
+import { ArticleShareBar } from './components/ArticleShareBar';
 import { BusTimingsSection } from './components/BusTimingsSection';
 import { CategoryBar, getCategoryShortIcon } from './components/CategoryBar';
 import { CoffeeCupLogo } from './components/CoffeeCupLogo';
+import { FeaturedLeadCarousel } from './components/FeaturedLeadCarousel';
 import { Header } from './components/Header';
 import { NewsImage } from './components/NewsImage';
+import { PrivacyScreenGuard } from './components/PrivacyScreenGuard';
+import { ProgramsEventsSection } from './components/ProgramsEventsSection';
 import { RightRail } from './components/RightRail';
+import { SupportChatSection } from './components/SupportChatSection';
+import { WhatsAppGroupBanner } from './components/WhatsAppGroupBanner';
 import {
-  INITIAL_ARTICLES,
   NEWS_CATEGORIES,
+  getKannadaLocationLabel,
+  matchesSelectedLocation,
   resolveArticleImage,
 } from './data/newsData';
-import type { FilterCategory, NewsArticle } from './types/news';
+import {
+  getArticleByIdFromFirestore,
+  loadInitialArticles,
+  loadMoreArticles,
+  subscribeToArticlesState,
+} from './services/articlesStore';
+import {
+  checkReaderThreadSummaryOnce,
+  getOrCreateReaderThreadId,
+} from './services/chatStore';
+import {
+  getEventByIdFromFirestore,
+  loadInitialEvents,
+  loadMoreEvents,
+  subscribeToEventsState,
+} from './services/eventsStore';
+import { subscribeToQuotaStatus, type QuotaStatus } from './services/firestoreOptimizer';
+import type { FilterCategory, NewsArticle, ProgramEvent, SupportThread } from './types/news';
+import { sanitizeRichTextHtml, stripRichTextToPlainText } from './utils/richText';
 
 type TimeframeFilter = 'All' | 'Today' | 'Yesterday' | 'This Week';
 
@@ -28,16 +52,96 @@ function isBusTimingsPath(pathname: string): boolean {
   return normalized === '/bus-timings' || normalized.startsWith('/bus-timings/');
 }
 
-function parseArticleDateToMidnight(dateStr: string): number | null {
+function isEventsPath(pathname: string): boolean {
+  const normalized = pathname.replace(/\/+$/, '') || '/';
+  return normalized === '/events' || normalized.startsWith('/events/');
+}
+
+function isChatPath(pathname: string): boolean {
+  const normalized = pathname.replace(/\/+$/, '') || '/';
+  return normalized === '/chat' || normalized.startsWith('/chat/');
+}
+
+function parseArticleDateToMidnight(dateStr: string, timestamp?: number): number | null {
+  if (typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0) {
+    const dt = new Date(timestamp);
+    return new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()).getTime();
+  }
   const parsed = new Date(dateStr.trim());
   if (Number.isNaN(parsed.getTime())) return null;
   return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate()).getTime();
 }
 
+function formatDateLabelFromMidnight(midnightMs: number): string {
+  return new Date(midnightMs).toLocaleDateString('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  });
+}
+
+interface DateWiseArticleGroup {
+  key: string;
+  heading: string;
+  subLabel?: string;
+  sortDayMs: number;
+  articles: NewsArticle[];
+}
+
+function groupArticlesByDate(list: NewsArticle[]): DateWiseArticleGroup[] {
+  const now = new Date();
+  const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const oneDayMs = 24 * 60 * 60 * 1000;
+  const groupsMap = new Map<string, DateWiseArticleGroup>();
+
+  for (const article of list) {
+    const midnight = parseArticleDateToMidnight(article.publishedDate, article.publishedTimestamp);
+    const sortDayMs = midnight ?? 0;
+    const formattedDate = midnight !== null ? formatDateLabelFromMidnight(midnight) : article.publishedDate || 'Archive';
+    const diffDays = midnight !== null ? Math.round((todayMidnight - midnight) / oneDayMs) : null;
+
+    let heading = formattedDate;
+    let subLabel: string | undefined;
+    if (diffDays === 0) {
+      heading = 'Today';
+      subLabel = formattedDate;
+    } else if (diffDays === 1) {
+      heading = 'Yesterday';
+      subLabel = formattedDate;
+    }
+
+    const key = midnight !== null ? String(midnight) : `date:${formattedDate}`;
+    const existing = groupsMap.get(key);
+    if (existing) {
+      existing.articles.push(article);
+    } else {
+      groupsMap.set(key, {
+        key,
+        heading,
+        subLabel,
+        sortDayMs,
+        articles: [article],
+      });
+    }
+  }
+
+  return Array.from(groupsMap.values())
+    .sort((a, b) => b.sortDayMs - a.sortDayMs)
+    .map((group) => ({
+      ...group,
+      articles: [...group.articles].sort(
+        (a, b) => (b.publishedTimestamp ?? 0) - (a.publishedTimestamp ?? 0)
+      ),
+    }));
+}
+
 function matchesTimeframe(article: NewsArticle, timeframe: TimeframeFilter): boolean {
   if (timeframe === 'All') return true;
 
-  const articleMidnight = parseArticleDateToMidnight(article.publishedDate);
+  const articleMidnight = parseArticleDateToMidnight(
+    article.publishedDate,
+    article.publishedTimestamp
+  );
   if (articleMidnight === null) return false;
 
   const now = new Date();
@@ -54,49 +158,313 @@ function matchesTimeframe(article: NewsArticle, timeframe: TimeframeFilter): boo
   return diffDays >= 0 && diffDays <= 6;
 }
 
+function readArticleIdFromUrl(): string | null {
+  try {
+    const id = new URLSearchParams(window.location.search).get('article');
+    return id && id.trim() ? id.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function readEventIdFromUrl(): string | null {
+  try {
+    const id = new URLSearchParams(window.location.search).get('event');
+    return id && id.trim() ? id.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function ArticleLoadingSkeleton({ onBack }: { onBack: () => void }) {
+  return (
+    <main
+      aria-busy="true"
+      aria-label="Loading selected article"
+      className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-10"
+    >
+      <div className="flex items-center justify-between gap-4 pb-6 border-b border-stone-200">
+        <button
+          type="button"
+          onClick={onBack}
+          className="text-sm font-medium text-stone-600 hover:text-[#0F274A] cursor-pointer px-2 -ml-2 min-h-[40px]"
+        >
+          ← Back to Feed
+        </button>
+        <div className="h-8 w-36 rounded-md bg-stone-200 animate-pulse" />
+      </div>
+      <div className="py-8 max-w-3xl mx-auto space-y-5">
+        <div className="h-4 w-56 rounded bg-stone-200 animate-pulse" />
+        <div className="h-9 w-full rounded bg-stone-200 animate-pulse" />
+        <div className="h-9 w-4/5 rounded bg-stone-200 animate-pulse" />
+        <div className="h-5 w-full rounded bg-stone-100 animate-pulse" />
+        <div className="aspect-[16/9] w-full rounded-md bg-stone-200 animate-pulse" />
+        <div className="space-y-3 pt-2">
+          <div className="h-4 w-full rounded bg-stone-100 animate-pulse" />
+          <div className="h-4 w-11/12 rounded bg-stone-100 animate-pulse" />
+          <div className="h-4 w-5/6 rounded bg-stone-100 animate-pulse" />
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function FeedLoadingSkeleton() {
+  return (
+    <div aria-busy="true" aria-label="Loading latest news" className="space-y-4">
+      <div className="rounded-2xl h-[250px] sm:h-[275px] bg-slate-200 animate-pulse" />
+      {[1, 2, 3, 4].map((idx) => (
+        <div
+          key={idx}
+          className="bg-white border border-slate-200 rounded-xl p-3 sm:p-4 flex items-center gap-3.5 sm:gap-4"
+        >
+          <div className="w-24 h-20 sm:w-36 sm:h-24 shrink-0 rounded-lg bg-slate-200 animate-pulse" />
+          <div className="flex-1 space-y-2.5">
+            <div className="h-3 w-28 rounded bg-slate-200 animate-pulse" />
+            <div className="h-4 w-full rounded bg-slate-200 animate-pulse" />
+            <div className="h-3 w-3/4 rounded bg-slate-100 animate-pulse" />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
   const [pathname, setPathname] = useState<string>(() => window.location.pathname);
-  const [articles, setArticles] = useState<NewsArticle[]>(INITIAL_ARTICLES);
+  const [articles, setArticles] = useState<NewsArticle[]>([]);
+  const [articlesLoaded, setArticlesLoaded] = useState<boolean>(false);
+  const [hasMoreArticles, setHasMoreArticles] = useState<boolean>(false);
+  const [loadingMoreArticles, setLoadingMoreArticles] = useState<boolean>(false);
+  const [events, setEvents] = useState<ProgramEvent[]>([]);
+  const [eventsLoaded, setEventsLoaded] = useState<boolean>(false);
+  const [hasMoreEvents, setHasMoreEvents] = useState<boolean>(false);
+  const [loadingMoreEvents, setLoadingMoreEvents] = useState<boolean>(false);
+  const [directEvent, setDirectEvent] = useState<ProgramEvent | null>(null);
+  const [directEventLoading, setDirectEventLoading] = useState<boolean>(() =>
+    Boolean(readEventIdFromUrl())
+  );
+  const [quotaStatus, setQuotaStatus] = useState<QuotaStatus>({
+    quotaExceeded: false,
+    lastErrorAt: 0,
+    cooldownUntil: 0,
+    message: '',
+  });
+  const [readerThread, setReaderThread] = useState<SupportThread | null>(null);
+  const readerThreadId = useMemo(() => getOrCreateReaderThreadId(), []);
   const [activeCategory, setActiveCategory] = useState<FilterCategory>('All');
   const [selectedLocation, setSelectedLocation] = useState<string>('All');
   const [timeframe, setTimeframe] = useState<TimeframeFilter>('All');
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [selectedArticleId, setSelectedArticleId] = useState<string | null>(null);
+  const [selectedArticleId, setSelectedArticleId] = useState<string | null>(() =>
+    readArticleIdFromUrl()
+  );
+  const [directArticle, setDirectArticle] = useState<NewsArticle | null>(null);
+  const [directArticleLoading, setDirectArticleLoading] = useState<boolean>(() =>
+    Boolean(readArticleIdFromUrl())
+  );
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(() =>
+    readEventIdFromUrl()
+  );
 
   useEffect(() => {
+    // Clear any stale browser CacheStorage / ServiceWorker caches from earlier builds
+    try {
+      if ('caches' in window) {
+        void window.caches.keys().then((keys) => {
+          keys.forEach((key) => {
+            void window.caches.delete(key);
+          });
+        });
+      }
+      if ('serviceWorker' in navigator) {
+        void navigator.serviceWorker.getRegistrations().then((regs) => {
+          regs.forEach((reg) => {
+            void reg.unregister();
+          });
+        });
+      }
+    } catch {
+      // Ignore cache cleanup errors
+    }
+
     const handlePopState = () => {
       setPathname(window.location.pathname);
+      setSelectedArticleId(readArticleIdFromUrl());
+      setSelectedEventId(readEventIdFromUrl());
     };
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
+  // Subscribe to in-memory shared stores & quota monitor (0 Firestore reads)
   useEffect(() => {
-    let cancelled = false;
-    fetch('/api/articles')
-      .then(async (res) => {
-        if (!res.ok) return null;
-        return (await res.json()) as { articles?: NewsArticle[] };
-      })
-      .then((data) => {
-        if (!cancelled && data?.articles && Array.isArray(data.articles)) {
-          setArticles(data.articles);
-        }
-      })
-      .catch(() => {
-        // Keep initial articles seamlessly if offline
-      });
+    const unsubArticles = subscribeToArticlesState((state) => {
+      setArticles(state.articles);
+      setArticlesLoaded(state.loaded);
+      setHasMoreArticles(state.hasMore);
+    });
+    const unsubEvents = subscribeToEventsState((state) => {
+      setEvents(state.events);
+      setEventsLoaded(state.loaded);
+      setHasMoreEvents(state.hasMore);
+    });
+    const unsubQuota = subscribeToQuotaStatus((nextStatus) => {
+      setQuotaStatus(nextStatus);
+    });
     return () => {
-      cancelled = true;
+      unsubArticles();
+      unsubEvents();
+      unsubQuota();
     };
   }, []);
 
-  const navigateTo = (targetPath: string) => {
-    if (window.location.pathname !== targetPath) {
-      window.history.pushState({}, '', targetPath);
-      setPathname(targetPath);
+  const adminRouteActive = isAdminPath(pathname);
+  const busTimingsActiveCheck = isBusTimingsPath(pathname);
+  const eventsActiveCheck = isEventsPath(pathname);
+  const chatActiveCheck = isChatPath(pathname);
+
+  // Lazy-load initial news feed ONLY when viewing the public news feed (never on /admin, /events, /bus-timings, /chat, or direct ?article=id)
+  useEffect(() => {
+    if (
+      adminRouteActive ||
+      busTimingsActiveCheck ||
+      eventsActiveCheck ||
+      chatActiveCheck ||
+      selectedArticleId
+    ) {
+      return;
     }
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    void loadInitialArticles();
+  }, [
+    adminRouteActive,
+    busTimingsActiveCheck,
+    eventsActiveCheck,
+    chatActiveCheck,
+    selectedArticleId,
+  ]);
+
+  // Lazy-load initial events list ONLY when visiting /events without a direct ?event=id
+  useEffect(() => {
+    if (adminRouteActive || !eventsActiveCheck || selectedEventId) {
+      return;
+    }
+    void loadInitialEvents();
+  }, [adminRouteActive, eventsActiveCheck, selectedEventId]);
+
+  // Lightweight cached check for reader chat unread badge (0 reads unless reader actually started a thread)
+  useEffect(() => {
+    if (adminRouteActive) return;
+    let cancelled = false;
+    void checkReaderThreadSummaryOnce(readerThreadId).then((thread) => {
+      if (!cancelled) {
+        setReaderThread(thread);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [adminRouteActive, readerThreadId, chatActiveCheck]);
+
+  // Direct single-doc lookup for shared article URLs (1 read max, or 0 if cached)
+  useEffect(() => {
+    if (!selectedArticleId) {
+      setDirectArticle(null);
+      setDirectArticleLoading(false);
+      return;
+    }
+
+    const fromList = articles.find((a) => a.id === selectedArticleId);
+    if (fromList) {
+      setDirectArticle(fromList);
+      setDirectArticleLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setDirectArticle(null);
+    setDirectArticleLoading(true);
+
+    void getArticleByIdFromFirestore(selectedArticleId)
+      .then((found) => {
+        if (cancelled) return;
+        setDirectArticle(found);
+        setDirectArticleLoading(false);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDirectArticleLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedArticleId, articles]);
+
+  // Direct single-doc lookup for shared program/event URLs (1 read max, or 0 if cached)
+  useEffect(() => {
+    if (!eventsActiveCheck || !selectedEventId) {
+      setDirectEvent(null);
+      setDirectEventLoading(false);
+      return;
+    }
+
+    const fromList = events.find((ev) => ev.id === selectedEventId);
+    if (fromList) {
+      setDirectEvent(fromList);
+      setDirectEventLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setDirectEvent(null);
+    setDirectEventLoading(true);
+
+    void getEventByIdFromFirestore(selectedEventId)
+      .then((found) => {
+        if (cancelled) return;
+        setDirectEvent(found);
+        setDirectEventLoading(false);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDirectEventLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [eventsActiveCheck, selectedEventId, events]);
+
+  const handleLoadMoreArticles = async () => {
+    if (loadingMoreArticles || !hasMoreArticles) return;
+    setLoadingMoreArticles(true);
+    try {
+      await loadMoreArticles();
+    } finally {
+      setLoadingMoreArticles(false);
+    }
+  };
+
+  const handleLoadMoreEvents = async () => {
+    if (loadingMoreEvents || !hasMoreEvents) return;
+    setLoadingMoreEvents(true);
+    try {
+      await loadMoreEvents();
+    } finally {
+      setLoadingMoreEvents(false);
+    }
+  };
+
+  const navigateTo = (targetPath: string, instantScroll = false) => {
+    const currentFull = `${window.location.pathname}${window.location.search}`;
+    if (currentFull !== targetPath) {
+      window.history.pushState({}, '', targetPath);
+      setPathname(targetPath.split('?')[0] || '/');
+    }
+    window.scrollTo({ top: 0, behavior: instantScroll ? 'auto' : 'smooth' });
   };
 
   const filteredArticles = useMemo(() => {
@@ -105,7 +473,7 @@ export default function App() {
       if (activeCategory !== 'All' && article.category !== activeCategory) {
         return false;
       }
-      if (selectedLocation !== 'All' && article.location !== selectedLocation) {
+      if (!matchesSelectedLocation(article.location, selectedLocation)) {
         return false;
       }
       if (!matchesTimeframe(article, timeframe)) {
@@ -113,12 +481,12 @@ export default function App() {
       }
       if (q) {
         const haystack = [
-          article.titleKannada,
-          article.summaryKannada,
+          stripRichTextToPlainText(article.titleKannada),
+          stripRichTextToPlainText(article.summaryKannada),
           article.category,
           article.location,
           article.reporter,
-          ...article.bodyKannada,
+          ...article.bodyKannada.map((part) => stripRichTextToPlainText(part)),
         ]
           .join(' ')
           .toLowerCase();
@@ -128,9 +496,18 @@ export default function App() {
     });
   }, [articles, activeCategory, selectedLocation, timeframe, searchQuery]);
 
-  const selectedArticle = useMemo(
-    () => articles.find((a) => a.id === selectedArticleId) ?? null,
-    [articles, selectedArticleId]
+  const selectedArticle = useMemo(() => {
+    if (!selectedArticleId) return null;
+    const fromFeed = articles.find((a) => a.id === selectedArticleId);
+    if (fromFeed) return fromFeed;
+    if (directArticle && directArticle.id === selectedArticleId) {
+      return directArticle;
+    }
+    return null;
+  }, [articles, selectedArticleId, directArticle]);
+
+  const isWaitingForSelectedArticle = Boolean(
+    selectedArticleId && !selectedArticle && (!articlesLoaded || directArticleLoading)
   );
 
   const relatedArticles = useMemo(() => {
@@ -143,11 +520,15 @@ export default function App() {
   }, [articles, selectedArticle]);
 
   const busTimingsActive = isBusTimingsPath(pathname);
+  const eventsActive = isEventsPath(pathname);
+  const chatActive = isChatPath(pathname);
+  const isSpecialRoute = busTimingsActive || eventsActive || chatActive;
 
   const handleSelectCategory = (category: FilterCategory) => {
     setActiveCategory(category);
     setSelectedArticleId(null);
-    if (busTimingsActive) {
+    setSelectedEventId(null);
+    if (isSpecialRoute || window.location.search) {
       navigateTo('/');
     } else {
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -160,7 +541,8 @@ export default function App() {
     setTimeframe('All');
     setSearchQuery('');
     setSelectedArticleId(null);
-    if (busTimingsActive) {
+    setSelectedEventId(null);
+    if (isSpecialRoute || window.location.search) {
       navigateTo('/');
     } else {
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -168,70 +550,145 @@ export default function App() {
   };
 
   const handleOpenArticle = (article: NewsArticle) => {
+    setSelectedEventId(null);
+    setDirectArticle(article);
+    setDirectArticleLoading(false);
     setSelectedArticleId(article.id);
-    if (busTimingsActive) {
-      navigateTo('/');
-    } else {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
+    navigateTo(`/?article=${encodeURIComponent(article.id)}`, true);
+  };
+
+  const handleCloseArticle = () => {
+    setSelectedArticleId(null);
+    setDirectArticle(null);
+    setDirectArticleLoading(false);
+    navigateTo('/', true);
+  };
+
+  const handleOpenEvent = (ev: ProgramEvent) => {
+    setSelectedArticleId(null);
+    setSelectedEventId(ev.id);
+    navigateTo(`/events?event=${encodeURIComponent(ev.id)}`);
+  };
+
+  const handleCloseEvent = () => {
+    setSelectedEventId(null);
+    navigateTo('/events');
   };
 
   const handleJumpToBusTimings = () => {
     setSelectedArticleId(null);
+    setSelectedEventId(null);
     navigateTo('/bus-timings');
   };
+
+  const handleJumpToEvents = () => {
+    setSelectedArticleId(null);
+    setSelectedEventId(null);
+    navigateTo('/events');
+  };
+
+  const handleJumpToChat = () => {
+    setSelectedArticleId(null);
+    setSelectedEventId(null);
+    navigateTo('/chat');
+  };
+
+  const leadArticles = useMemo(
+    () => filteredArticles.filter((a) => a.isFeatured),
+    [filteredArticles]
+  );
+  const dateGroups = useMemo(() => groupArticlesByDate(filteredArticles), [filteredArticles]);
 
   if (isAdminPath(pathname)) {
     return (
       <AdminPanel
         articles={articles}
-        onArticlesUpdated={(next) => setArticles(next)}
         onNavigateHome={() => navigateTo('/')}
       />
     );
   }
 
-  const leadArticle =
-    filteredArticles.find((a) => a.isFeatured) ?? filteredArticles[0] ?? null;
-  const timelineArticles = leadArticle
-    ? filteredArticles.filter((a) => a.id !== leadArticle.id)
-    : [];
-
   return (
-    <div className="min-h-screen flex flex-col bg-[#F2F5F8] text-slate-900">
-      <Header
-        activeCategory={activeCategory}
-        isBusTimingsView={busTimingsActive}
-        onSelectCategory={handleSelectCategory}
-        onResetHome={handleResetHome}
-        onJumpToBusTimings={handleJumpToBusTimings}
-      />
-
-      {!selectedArticle && !busTimingsActive && (
-        <CategoryBar
+    <PrivacyScreenGuard enabled={!isAdminPath(pathname)}>
+      <div className="min-h-screen flex flex-col bg-[#F2F5F8] text-slate-900">
+        <WhatsAppGroupBanner variant="top-bar" />
+        <Header
           activeCategory={activeCategory}
+          isBusTimingsView={busTimingsActive}
+          isEventsView={eventsActive}
+          isChatView={chatActive}
           onSelectCategory={handleSelectCategory}
-          selectedLocation={selectedLocation}
-          onSelectLocation={setSelectedLocation}
-          searchQuery={searchQuery}
-          onSearchChange={setSearchQuery}
+          onResetHome={handleResetHome}
+          onJumpToBusTimings={handleJumpToBusTimings}
+          onJumpToEvents={handleJumpToEvents}
         />
-      )}
 
-      {busTimingsActive ? (
-        <main className="flex-1">
-          <BusTimingsSection onBackToNews={handleResetHome} />
-        </main>
-      ) : selectedArticle ? (
-        <div className="flex-1 bg-white">
-          <ArticleDetailView
-            article={selectedArticle}
-            relatedArticles={relatedArticles}
-            onBack={() => setSelectedArticleId(null)}
-            onSelectArticle={handleOpenArticle}
+        {!selectedArticleId && !isSpecialRoute && (
+          <CategoryBar
+            activeCategory={activeCategory}
+            onSelectCategory={handleSelectCategory}
+            selectedLocation={selectedLocation}
+            onSelectLocation={setSelectedLocation}
+            searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
           />
-        </div>
-      ) : (
+        )}
+
+        {busTimingsActive ? (
+          <main className="flex-1">
+            <BusTimingsSection onBackToNews={handleResetHome} />
+          </main>
+        ) : eventsActive ? (
+          <main className="flex-1">
+            <ProgramsEventsSection
+              events={events}
+              directEvent={directEvent}
+              isLoading={selectedEventId ? directEventLoading && !directEvent : !eventsLoaded}
+              selectedEventId={selectedEventId}
+              hasMoreEvents={hasMoreEvents}
+              loadingMoreEvents={loadingMoreEvents}
+              quotaExceeded={quotaStatus.quotaExceeded}
+              onLoadMoreEvents={handleLoadMoreEvents}
+              onSelectEvent={handleOpenEvent}
+              onCloseEvent={handleCloseEvent}
+              onBackToNews={handleResetHome}
+            />
+          </main>
+        ) : chatActive ? (
+          <main className="flex-1">
+            <SupportChatSection onBackToNews={handleResetHome} />
+          </main>
+        ) : selectedArticleId ? (
+          <div className="flex-1 bg-white">
+            {selectedArticle ? (
+              <ArticleDetailView
+                key={selectedArticle.id}
+                article={selectedArticle}
+                relatedArticles={relatedArticles}
+                onBack={handleCloseArticle}
+                onSelectArticle={handleOpenArticle}
+              />
+            ) : isWaitingForSelectedArticle ? (
+              <ArticleLoadingSkeleton onBack={handleCloseArticle} />
+            ) : (
+              <main className="max-w-2xl mx-auto px-4 py-16 text-center space-y-3">
+                <h1 className="text-lg font-bold text-slate-900">
+                  Selected article could not be found
+                </h1>
+                <p className="text-sm text-slate-600">
+                  This story may have been removed or moved by the editorial desk.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleCloseArticle}
+                  className="px-4 py-2 text-xs font-semibold text-white bg-[#0F274A] hover:bg-[#173a6e] rounded-lg cursor-pointer min-h-[40px]"
+                >
+                  Back to Latest News
+                </button>
+              </main>
+            )}
+          </div>
+        ) : (
         <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-6">
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
             {/* Left/Main Timeline Feed (8 cols on desktop, full width on mobile) */}
@@ -285,7 +742,21 @@ export default function App() {
                 </div>
               </div>
 
-              {filteredArticles.length === 0 ? (
+              {quotaStatus.quotaExceeded && (
+                <div
+                  role="status"
+                  className="mb-4 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2.5 text-xs text-amber-950"
+                >
+                  <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" aria-hidden="true" />
+                  <p className="font-kannada leading-relaxed">
+                    Daily live database read limit temporarily reached. Showing saved news stories — live sync resumes automatically after quota reset.
+                  </p>
+                </div>
+              )}
+
+              {!articlesLoaded ? (
+                <FeedLoadingSkeleton />
+              ) : filteredArticles.length === 0 ? (
                 <div className="bg-white border border-slate-200 rounded-xl p-8 text-center">
                   <h2 className="text-base font-bold text-slate-900 mb-1.5">
                     No matching updates found
@@ -309,158 +780,167 @@ export default function App() {
                     aria-hidden="true"
                   />
 
-                  <div className="space-y-4">
-                    {/* Featured Lead Story Banner Card */}
-                    {leadArticle && (
-                      <div className="relative">
-                        <span
-                          className="absolute -left-6 sm:-left-7 top-6 w-3 h-3 rounded-full border-2 border-amber-400 bg-white z-10"
-                          aria-hidden="true"
-                        />
-                        <article
-                          onClick={() => handleOpenArticle(leadArticle)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' || e.key === ' ') {
-                              e.preventDefault();
-                              handleOpenArticle(leadArticle);
-                            }
-                          }}
-                          role="button"
-                          tabIndex={0}
-                          className="group relative rounded-2xl overflow-hidden border border-slate-200 shadow-sm cursor-pointer min-h-[240px] sm:min-h-[270px] flex flex-col justify-between p-5 sm:p-6 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F274A]"
-                        >
-                          <img
-                            src={resolveArticleImage(leadArticle) || koppaLandscapeImg}
-                            alt={leadArticle.titleKannada}
-                            referrerPolicy="no-referrer"
-                            className="absolute inset-0 w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
-                          />
-                          <div
-                            className="absolute inset-0 bg-gradient-to-r from-slate-950/95 via-slate-950/75 to-slate-950/30"
-                            aria-hidden="true"
-                          />
+                  <div className="space-y-6">
+                    {/* Sliding Featured Lead Stories Carousel */}
+                    <FeaturedLeadCarousel
+                      leadArticles={leadArticles}
+                      onOpenArticle={handleOpenArticle}
+                    />
 
-                          {/* Top row */}
-                          <div className="relative z-10 flex items-center justify-between gap-3 text-xs">
-                            <span className="font-semibold text-amber-300 tracking-wide">
-                              Featured · {leadArticle.location}
-                            </span>
-                            <span className="inline-flex items-center gap-1 text-slate-200 tabular-nums">
-                              <Clock className="w-3.5 h-3.5" aria-hidden="true" />
-                              <span>{leadArticle.publishedDate}</span>
-                            </span>
-                          </div>
-
-                          {/* Center Kannada Headline & Summary */}
-                          <div className="relative z-10 my-4 max-w-xl space-y-2">
-                            <h2 className="font-kannada text-xl sm:text-2xl lg:text-[28px] font-bold text-white leading-snug text-balance">
-                              {leadArticle.titleKannada}
-                            </h2>
-                            <p className="font-kannada text-xs sm:text-sm text-slate-200 leading-relaxed line-clamp-2">
-                              {leadArticle.summaryKannada}
-                            </p>
-                          </div>
-
-                          {/* Bottom row */}
-                          <div className="relative z-10 flex items-center justify-between gap-3">
-                            <span className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-slate-950 bg-white group-hover:bg-amber-300 rounded-lg transition-colors">
-                              <span>Read More</span>
-                              <ArrowRight className="w-3.5 h-3.5" aria-hidden="true" />
-                            </span>
-
-                            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-white">
-                              {getCategoryShortIcon(leadArticle.category)}
-                              <span>{leadArticle.category}</span>
-                            </span>
-                          </div>
-                        </article>
-                      </div>
-                    )}
-
-                    {/* Timeline Horizontal Story Cards */}
-                    {timelineArticles.map((article, index) => {
-                      const imgSrc = resolveArticleImage(article);
-                      const isAccentNode = index % 2 === 1;
-                      return (
-                        <div key={article.id} className="relative">
+                    {/* Date-Wise Sections: Today, Yesterday, and older dates */}
+                    {dateGroups.map((group) => (
+                      <section
+                        key={group.key}
+                        aria-label={`${group.heading} news`}
+                        className="space-y-3"
+                      >
+                        <div className="relative flex items-center justify-between gap-3 pt-1">
                           <span
-                            className={`absolute -left-6 sm:-left-7 top-1/2 -translate-y-1/2 w-3 h-3 rounded-full border-2 bg-white z-10 ${
-                              isAccentNode ? 'border-amber-400' : 'border-[#0F274A]'
-                            }`}
+                            className="absolute -left-6 sm:-left-7 top-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full bg-[#0F274A] border-2 border-amber-400 z-10"
                             aria-hidden="true"
                           />
-
-                          <article
-                            onClick={() => handleOpenArticle(article)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter' || e.key === ' ') {
-                                e.preventDefault();
-                                handleOpenArticle(article);
-                              }
-                            }}
-                            role="button"
-                            tabIndex={0}
-                            className="group bg-white border border-slate-200 hover:border-slate-300 rounded-xl p-3 sm:p-4 shadow-2xs transition-colors flex items-center gap-3.5 sm:gap-4 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F274A]"
-                          >
-                            {/* Left Thumbnail */}
-                            <div className="w-24 h-20 sm:w-36 sm:h-24 shrink-0 rounded-lg overflow-hidden bg-slate-100 border border-slate-200">
-                              {imgSrc ? (
-                                <NewsImage
-                                  src={imgSrc}
-                                  alt={article.titleKannada}
-                                  aspectClass="w-full h-full"
-                                  className="h-full"
-                                />
-                              ) : (
-                                <div className="w-full h-full flex flex-col items-center justify-center text-[#0F274A] bg-slate-100 p-2 text-center">
-                                  {getCategoryShortIcon(article.category)}
-                                  <span className="text-[10px] font-semibold mt-1 text-slate-600">
-                                    {article.category}
-                                  </span>
-                                </div>
-                              )}
-                            </div>
-
-                            {/* Center Content */}
-                            <div className="flex-1 min-w-0 space-y-1">
-                              <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-semibold text-slate-500">
-                                <span className="text-[#0F274A]">{article.category}</span>
-                                <span aria-hidden="true">·</span>
-                                <span>{article.location}</span>
-                              </div>
-
-                              <h3 className="font-kannada text-sm sm:text-base font-bold text-slate-900 group-hover:text-[#0F274A] transition-colors leading-snug line-clamp-2">
-                                {article.titleKannada}
-                              </h3>
-
-                              <p className="font-kannada text-xs text-slate-600 line-clamp-1">
-                                {article.summaryKannada}
-                              </p>
-
-                              <div className="flex items-center gap-2 text-[11px] text-slate-500 pt-0.5 tabular-nums">
-                                <span className="inline-flex items-center gap-1">
-                                  <Clock className="w-3 h-3" aria-hidden="true" />
-                                  <span>{article.publishedDate}</span>
-                                </span>
-                                <span aria-hidden="true">·</span>
-                                <span>{article.publishedTime}</span>
-                                <span aria-hidden="true">·</span>
-                                <span>{article.readTimeMinutes} min read</span>
-                              </div>
-                            </div>
-
-                            {/* Right Chevron Affordance */}
-                            <div
-                              className="w-8 h-8 rounded-full bg-slate-100 text-slate-700 group-hover:bg-[#0F274A] group-hover:text-white transition-colors flex items-center justify-center shrink-0"
-                              aria-hidden="true"
-                            >
-                              <ChevronRight className="w-4 h-4" />
-                            </div>
-                          </article>
+                          <div className="flex items-baseline gap-2.5">
+                            <h2 className="text-sm sm:text-base font-extrabold text-[#0F274A] tracking-tight">
+                              {group.heading}
+                            </h2>
+                            {group.subLabel && (
+                              <span className="text-xs font-medium text-slate-500">
+                                {group.subLabel}
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-[11px] font-semibold text-slate-500 tabular-nums">
+                            {group.articles.length}{' '}
+                            {group.articles.length === 1 ? 'story' : 'stories'}
+                          </span>
                         </div>
-                      );
-                    })}
+
+                        <div className="space-y-3">
+                          {group.articles.map((article, index) => {
+                            const imgSrc = resolveArticleImage(article);
+                            const isAccentNode = index % 2 === 1;
+                            return (
+                              <div key={article.id} className="relative">
+                                <span
+                                  className={`absolute -left-6 sm:-left-7 top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full border-2 bg-white z-10 ${
+                                    isAccentNode ? 'border-amber-400' : 'border-slate-400'
+                                  }`}
+                                  aria-hidden="true"
+                                />
+
+                                <article
+                                  onClick={() => handleOpenArticle(article)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      e.preventDefault();
+                                      handleOpenArticle(article);
+                                    }
+                                  }}
+                                  role="button"
+                                  tabIndex={0}
+                                  className="group bg-white border border-slate-200 hover:border-slate-300 rounded-xl p-3 sm:p-4 shadow-2xs transition-colors flex items-center gap-3.5 sm:gap-4 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F274A]"
+                                >
+                                  {/* Left Thumbnail */}
+                                  <div className="w-24 h-20 sm:w-36 sm:h-24 shrink-0 rounded-lg overflow-hidden bg-slate-100 border border-slate-200">
+                                    {imgSrc ? (
+                                      <NewsImage
+                                        src={imgSrc}
+                                        alt={stripRichTextToPlainText(article.titleKannada)}
+                                        aspectClass="w-full h-full"
+                                        watermarkApplied={Boolean(article.watermarkApplied && article.imageUrl)}
+                                        className="h-full"
+                                      />
+                                    ) : (
+                                      <div className="w-full h-full flex flex-col items-center justify-center text-[#0F274A] bg-slate-100 p-2 text-center">
+                                        {getCategoryShortIcon(article.category)}
+                                        <span className="text-[10px] font-semibold mt-1 text-slate-600">
+                                          {article.category}
+                                        </span>
+                                      </div>
+                                    )}
+                                  </div>
+
+                                  {/* Center Content */}
+                                  <div className="flex-1 min-w-0 space-y-1">
+                                    <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-semibold text-slate-500">
+                                      <span className="text-[#0F274A]">{article.category}</span>
+                                      <span aria-hidden="true">·</span>
+                                      <span className="font-kannada">{getKannadaLocationLabel(article.location)}</span>
+                                      {article.isFeatured && (
+                                        <>
+                                          <span aria-hidden="true">·</span>
+                                          <span className="text-amber-700">Featured</span>
+                                        </>
+                                      )}
+                                    </div>
+
+                                    <h3
+                                      className="article-rich-content article-rich-inline-compact font-kannada text-sm sm:text-base font-bold text-slate-900 group-hover:text-[#0F274A] transition-colors leading-snug line-clamp-2"
+                                      dangerouslySetInnerHTML={{
+                                        __html: sanitizeRichTextHtml(article.titleKannada),
+                                      }}
+                                    />
+
+                                    <div
+                                      className="article-rich-content article-rich-inline-compact font-kannada text-xs text-slate-600 line-clamp-1"
+                                      dangerouslySetInnerHTML={{
+                                        __html: sanitizeRichTextHtml(article.summaryKannada),
+                                      }}
+                                    />
+
+                                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                                      <div className="flex items-center gap-2 text-[11px] text-slate-500 tabular-nums">
+                                        <span className="inline-flex items-center gap-1">
+                                          <Clock className="w-3 h-3" aria-hidden="true" />
+                                          <span>{article.publishedDate}</span>
+                                        </span>
+                                        <span aria-hidden="true">·</span>
+                                        <span>{article.publishedTime}</span>
+                                        <span aria-hidden="true">·</span>
+                                        <span>{article.readTimeMinutes} min read</span>
+                                      </div>
+
+                                      <ArticleShareBar article={article} compact variant="light" />
+                                    </div>
+
+                                    <WhatsAppGroupBanner variant="inline-news" />
+                                  </div>
+
+                                  {/* Right Chevron Affordance */}
+                                  <div
+                                    className="hidden sm:flex w-8 h-8 rounded-full bg-slate-100 text-slate-700 group-hover:bg-[#0F274A] group-hover:text-white transition-colors items-center justify-center shrink-0"
+                                    aria-hidden="true"
+                                  >
+                                    <ChevronRight className="w-4 h-4" />
+                                  </div>
+                                </article>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </section>
+                    ))}
                   </div>
+
+                  {hasMoreArticles && (
+                    <div className="pt-5 flex justify-center">
+                      <button
+                        type="button"
+                        onClick={handleLoadMoreArticles}
+                        disabled={loadingMoreArticles}
+                        className="inline-flex items-center gap-2 px-5 py-2.5 text-xs sm:text-sm font-semibold text-[#0F274A] bg-white hover:bg-slate-50 border border-slate-300 rounded-xl shadow-2xs transition-colors cursor-pointer disabled:opacity-60 min-h-[42px]"
+                      >
+                        {loadingMoreArticles ? (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+                            <span>Loading older stories...</span>
+                          </>
+                        ) : (
+                          <span>Load More News</span>
+                        )}
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -480,37 +960,81 @@ export default function App() {
       )}
 
       <footer className="border-t border-slate-200 bg-white mt-10">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-          <div>
-            <div className="inline-flex items-center gap-2 font-masthead text-lg font-bold text-[#0F274A]">
-              <CoffeeCupLogo className="w-7 h-7 shrink-0" />
-              <span>Coffeenadu News</span>
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+            <div>
+              <div className="inline-flex items-center gap-2 font-masthead text-lg font-bold text-[#0F274A]">
+                <CoffeeCupLogo className="w-7 h-7 shrink-0" />
+                <span>Coffeenadu News</span>
+              </div>
+              <p className="text-xs text-slate-500 mt-1">
+                Koppa Taluk, Chikkamagaluru District · English navigation, Kannada reporting
+              </p>
             </div>
-            <p className="text-xs text-slate-500 mt-1">
-              Koppa Taluk, Chikkamagaluru District · English navigation, Kannada reporting
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-4 text-xs font-medium text-slate-600">
-            {NEWS_CATEGORIES.map((cat) => (
+            <div className="flex flex-wrap items-center gap-4 text-xs font-medium text-slate-600">
+              {NEWS_CATEGORIES.map((cat) => (
+                <button
+                  key={cat}
+                  type="button"
+                  onClick={() => handleSelectCategory(cat)}
+                  className="hover:text-[#0F274A] transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  {cat}
+                </button>
+              ))}
               <button
-                key={cat}
                 type="button"
-                onClick={() => handleSelectCategory(cat)}
-                className="hover:text-[#0F274A] transition-colors cursor-pointer whitespace-nowrap"
+                onClick={handleJumpToBusTimings}
+                className="font-semibold text-[#0F274A] hover:underline cursor-pointer whitespace-nowrap"
               >
-                {cat}
+                Bus Timings
               </button>
-            ))}
-            <button
-              type="button"
-              onClick={handleJumpToBusTimings}
-              className="font-semibold text-[#0F274A] hover:underline cursor-pointer whitespace-nowrap"
-            >
-              Bus Timings
-            </button>
+              <button
+                type="button"
+                onClick={handleJumpToEvents}
+                className="font-semibold text-emerald-800 hover:underline cursor-pointer whitespace-nowrap"
+              >
+                Programs &amp; Events
+              </button>
+              <button
+                type="button"
+                onClick={handleJumpToChat}
+                className="font-semibold text-[#0F274A] hover:underline cursor-pointer whitespace-nowrap"
+              >
+                Message Admin
+              </button>
+            </div>
+          </div>
+
+          <div className="pt-4 border-t border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 text-[11px] text-slate-500">
+            <p>
+              © {new Date().getFullYear()} Coffeenadu News · Koppa Taluk. All rights reserved.
+            </p>
+            <p>
+              Unauthorized copying, screenshotting, downloading, or redistribution of news content and photos is prohibited.
+            </p>
           </div>
         </div>
       </footer>
-    </div>
+
+      {/* Floating Message Admin Button at Bottom-Right Corner */}
+      {!chatActive && (
+        <button
+          type="button"
+          onClick={handleJumpToChat}
+          aria-label="Message Coffeenadu Admin"
+          className="fixed bottom-4 right-4 z-40 inline-flex items-center gap-2 px-4 py-2.5 text-xs sm:text-sm font-bold text-white bg-[#0F274A] hover:bg-[#173a6e] border border-amber-400/50 rounded-xl shadow-lg transition-transform hover:-translate-y-0.5 cursor-pointer min-h-[44px]"
+        >
+          <MessageSquare className="w-4 h-4 text-amber-300 shrink-0" aria-hidden="true" />
+          <span className="font-kannada whitespace-nowrap">Message · ಸಂದೇಶ</span>
+          {readerThread?.unreadByReader && (
+            <span className="ml-1 px-1.5 py-0.5 text-[10px] font-extrabold bg-amber-400 text-[#0F274A] rounded">
+              Reply
+            </span>
+          )}
+        </button>
+      )}
+      </div>
+    </PrivacyScreenGuard>
   );
 }

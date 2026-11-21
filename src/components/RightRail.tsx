@@ -1,4 +1,5 @@
-import { KOPPA_BRIEFS, KOPPA_LOCATIONS, KOPPA_MARKET_RATES } from '../data/newsData';
+import { KOPPA_BRIEFS, KOPPA_MARKET_RATES, KOPPA_PLACE_OPTIONS } from '../data/newsData';
+import { WhatsAppGroupBanner } from './WhatsAppGroupBanner';
 
 interface RightRailProps {
   selectedLocation: string;
@@ -8,11 +9,14 @@ interface RightRailProps {
 export function RightRail({ selectedLocation, onSelectLocation }: RightRailProps) {
   return (
     <aside aria-label="Koppa Taluk Quick Briefs and Market Rates" className="space-y-6">
-      {/* Town / Hobli Quick Filter */}
+      {/* Join Coffeenadu News WhatsApp Group */}
+      <WhatsAppGroupBanner variant="card" />
+
+      {/* Town / Hobli Quick Filter in Kannada */}
       <section className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-xs font-bold uppercase tracking-wider text-[#0F274A]">
-            Koppa Hubs
+            Places · ಸ್ಥಳಗಳು
           </h2>
           {selectedLocation !== 'All' && (
             <button
@@ -20,25 +24,36 @@ export function RightRail({ selectedLocation, onSelectLocation }: RightRailProps
               onClick={() => onSelectLocation('All')}
               className="text-xs font-semibold text-[#0F274A] hover:underline cursor-pointer"
             >
-              Reset
+              Show All
             </button>
           )}
         </div>
         <div className="flex flex-wrap gap-1.5">
-          {['All', ...KOPPA_LOCATIONS].map((loc) => {
-            const active = selectedLocation === loc;
+          <button
+            type="button"
+            onClick={() => onSelectLocation('All')}
+            className={`font-kannada px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer ${
+              selectedLocation === 'All'
+                ? 'bg-[#0F274A] text-white border-[#0F274A]'
+                : 'bg-slate-50 text-slate-700 border-slate-200 hover:border-slate-300'
+            }`}
+          >
+            ಎಲ್ಲಾ (Show All)
+          </button>
+          {KOPPA_PLACE_OPTIONS.map((place) => {
+            const active = selectedLocation === place.labelKn;
             return (
               <button
-                key={loc}
+                key={place.id}
                 type="button"
-                onClick={() => onSelectLocation(loc)}
-                className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer ${
+                onClick={() => onSelectLocation(place.labelKn)}
+                className={`font-kannada px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer ${
                   active
                     ? 'bg-[#0F274A] text-white border-[#0F274A]'
                     : 'bg-slate-50 text-slate-700 border-slate-200 hover:border-slate-300'
                 }`}
               >
-                {loc === 'All' ? 'All Towns' : loc}
+                {place.labelKn}
               </button>
             );
           })}

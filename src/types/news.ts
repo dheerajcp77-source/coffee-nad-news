@@ -1,19 +1,46 @@
 export type NewsCategory =
   | 'Local'
+  | 'Malnad'
   | 'Agriculture'
+  | 'Health'
+  | 'Entertainment'
+  | 'Crime'
+  | 'General'
+  | 'Politics'
+  | 'Sports'
+  | 'Special'
+  | 'State'
+  | 'Nation'
   | 'Civic & Roads'
   | 'Education'
-  | 'Culture'
-  | 'Sports';
+  | 'Culture';
 
 export type FilterCategory = 'All' | NewsCategory;
 
 export type ImageKey =
   | 'none'
   | 'koppa-landscape'
+  | 'malnad-hills'
   | 'coffee-estate'
+  | 'health-medical'
+  | 'entertainment-stage'
+  | 'crime-alert'
+  | 'general-news'
+  | 'politics-assembly'
+  | 'sports-stadium'
+  | 'special-feature'
+  | 'state-civic'
+  | 'nation-parliament'
   | 'tunga-bridge'
+  | 'education-library'
   | 'malnad-culture';
+
+export interface PlaceOption {
+  id: string;
+  labelKn: string;
+  labelEn: string;
+  aliases: string[];
+}
 
 export interface NewsArticle {
   id: string;
@@ -24,12 +51,59 @@ export interface NewsArticle {
   location: string;
   publishedDate: string;
   publishedTime: string;
+  publishedTimestamp?: number;
   readTimeMinutes: number;
   reporter: string;
   imageKey?: ImageKey;
   imageUrl?: string;
+  imageThumbUrl?: string;
+  imageDriveId?: string;
   imageCaption?: string;
   isFeatured?: boolean;
+  authorUid?: string;
+  viewCount?: number;
+  watermarkApplied?: boolean;
+}
+
+export interface ProgramEvent {
+  id: string;
+  titleKannada: string;
+  descriptionKannada: string;
+  eventDate: string; // YYYY-MM-DD
+  eventTime: string;
+  location: string;
+  organizer: string;
+  imageUrl?: string;
+  imageThumbUrl?: string;
+  imageDriveId?: string;
+  authorUid?: string;
+  createdTimestamp?: number;
+  viewCount?: number;
+  watermarkApplied?: boolean;
+}
+
+export interface SupportThread {
+  id: string;
+  senderName: string;
+  senderPhone?: string;
+  senderLocation: string;
+  topic: string;
+  lastMessage: string;
+  lastSenderRole: 'reader' | 'admin';
+  status: 'open' | 'replied' | 'closed';
+  unreadByAdmin: boolean;
+  unreadByReader: boolean;
+  createdTimestamp?: number;
+  updatedTimestamp?: number;
+}
+
+export interface SupportMessage {
+  id: string;
+  threadId: string;
+  senderRole: 'reader' | 'admin';
+  senderName: string;
+  text: string;
+  createdTimestamp?: number;
 }
 
 export interface LocalBrief {
@@ -104,4 +178,3 @@ export interface BusAgentResponse {
   matchedRoutes: BusAgentMatchedRoute[];
   suggestedHubs?: string[];
 }
-
